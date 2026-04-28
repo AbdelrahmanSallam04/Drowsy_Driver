@@ -1,62 +1,102 @@
 import cv2
 import tensorflow as tf
 import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import urllib.request
+import os
 
-# 1. Load your trained model
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# 1. Download the face detection model if not present
+MODEL_PATH = "blaze_face_short_range.tflite"
+if not os.path.exists(MODEL_PATH):
+    url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+    print("Downloading MediaPipe face model...")
+    urllib.request.urlretrieve(url, MODEL_PATH)
+
+# 2. Initialize the new MediaPipe Face Detector
+base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+options = vision.FaceDetectorOptions(
+    base_options=base_options,
+    min_detection_confidence=0.5
+)
+detector = vision.FaceDetector.create_from_options(options)
+
+# 3. Load your Keras model
 model = tf.keras.models.load_model('drowsy_model_v1.keras')
 
-# 2. Start the Webcam (0 is usually the default laptop camera)
 cap = cv2.VideoCapture(0)
 
-print("Starting Webcam... Press 'q' to quit.")
-
 while True:
-    # Capture frame-by-frame
     ret, frame = cap.read()
     if not ret:
         break
 
-    # --- Preprocessing for the Model ---
-    # 1. Flip frame horizontally for a "mirror" effect (optional)
     frame = cv2.flip(frame, 1)
-    
-    # 2. Convert BGR (OpenCV default) to RGB (Model default)
+    h, w, _ = frame.shape
+
+    # Convert to RGB for MediaPipe
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    # 3. Resize to 224x224
-    resized_frame = cv2.resize(rgb_frame, (224, 224))
-    
-    # 4. Add batch dimension (1, 224, 224, 3)
-    input_data = np.expand_dims(resized_frame, axis=0)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-    # --- Prediction ---
-    prediction = model.predict(input_data, verbose=0)[0][0]
-    
-    # --- Logic & Visualization ---
-    if prediction > 0.5:
-        label = "FATIGUE"
-        color = (0, 0, 255) # Red in BGR
-        confidence = prediction
-    else:
-        label = "ACTIVE"
-        color = (0, 255, 0) # Green in BGR
-        confidence = 1 - prediction
+    # Run detection
+    detection_result = detector.detect(mp_image)
 
-    # Display the result on the frame
-    text = f"{label}: {confidence*100:.1f}%"
-    cv2.putText(frame, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-    
-    # Draw a border/rectangle if Fatigue is detected
-    if label == "FATIGUE":
-        cv2.rectangle(frame, (0,0), (frame.shape[1], frame.shape[0]), (0,0,255), 10)
+    label = "Searching..."
+    color = (255, 255, 255)
 
-    # Show the video feed
-    cv2.imshow('Drowsiness Detection System', frame)
+    if detection_result.detections:
+        for detection in detection_result.detections:
+            bbox = detection.bounding_box
+            x, y = max(0, bbox.origin_x), max(0, bbox.origin_y)
+            bw, bh = bbox.width, bbox.height
 
-    # Press 'q' on the keyboard to exit the loop
+            # --- ADD PADDING (e.g., 20% expansion) ---
+            pad_y = int(bh * 0.20)
+            pad_x = int(bw * 0.20)
+            
+            y1 = max(0, y - pad_y)
+            y2 = min(h, y + bh + pad_y)
+            x1 = max(0, x - pad_x)
+            x2 = min(w, x + bw + pad_x)
+
+            # Crop the face with the new padded coordinates
+            face_img = frame[y1:y2, x1:x2]
+
+            if face_img.size > 0:
+                # Preprocess
+                resized_face = cv2.resize(face_img, (224, 224))
+                rgb_face = cv2.cvtColor(resized_face, cv2.COLOR_BGR2RGB)
+                input_data = np.expand_dims(rgb_face, axis=0)
+
+                # Predict
+                prediction = model.predict(input_data, verbose=0)[0][0]
+
+                if prediction > 0.5:
+                    label = "FATIGUE"
+                    color = (0, 0, 255) # Red
+                    confidence = prediction * 100
+                else:
+                    label = "ACTIVE"
+                    color = (0, 255, 0) # Green
+                    # If prediction is 0.2 (20% fatigue), it is 80% active
+                    confidence = (1.0 - prediction) * 100 
+
+                # Combine the label and the percentage (rounded to 1 decimal place)
+                display_text = f"{label}: {confidence:.1f}%"
+
+                # Draw the UI
+                cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
+                cv2.putText(frame, display_text, (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+    cv2.imshow('Face-Focused Detection', frame)
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Clean up
 cap.release()
 cv2.destroyAllWindows()
