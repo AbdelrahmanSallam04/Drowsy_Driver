@@ -6,6 +6,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import urllib.request
 import os
+from collections import deque
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -28,75 +29,66 @@ detector = vision.FaceDetector.create_from_options(options)
 # 3. Load your Keras model
 model = tf.keras.models.load_model('drowsy_model_v1.keras')
 
+# --- Smoothing Buffer ---
+prediction_history = deque(maxlen=10) 
+
 cap = cv2.VideoCapture(0)
 
 while True:
     ret, frame = cap.read()
-    if not ret:
-        break
+    if not ret: break
 
     frame = cv2.flip(frame, 1)
     h, w, _ = frame.shape
-
-    # Convert to RGB for MediaPipe
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-    # Run detection
     detection_result = detector.detect(mp_image)
-
-    label = "Searching..."
-    color = (255, 255, 255)
 
     if detection_result.detections:
         for detection in detection_result.detections:
             bbox = detection.bounding_box
-            x, y = max(0, bbox.origin_x), max(0, bbox.origin_y)
-            bw, bh = bbox.width, bbox.height
+            x, y, bw, bh = bbox.origin_x, bbox.origin_y, bbox.width, bbox.height
 
-            # --- ADD PADDING (e.g., 20% expansion) ---
-            pad_y = int(bh * 0.20)
-            pad_x = int(bw * 0.20)
+            # Square padding is better for MobileNet
+            side = max(bw, bh)
+            pad = int(side * 0.25)
             
-            y1 = max(0, y - pad_y)
-            y2 = min(h, y + bh + pad_y)
-            x1 = max(0, x - pad_x)
-            x2 = min(w, x + bw + pad_x)
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(w, x + side + pad)
+            y2 = min(h, y + side + pad)
 
-            # Crop the face with the new padded coordinates
             face_img = frame[y1:y2, x1:x2]
 
             if face_img.size > 0:
-                # Preprocess
+                # Preprocessing
                 resized_face = cv2.resize(face_img, (224, 224))
-                rgb_face = cv2.cvtColor(resized_face, cv2.COLOR_BGR2RGB)
-                input_data = np.expand_dims(rgb_face, axis=0)
+                # Convert to float32 for faster inference
+                input_data = np.expand_dims(resized_face, axis=0).astype(np.float32)
 
-                # Predict
-                prediction = model.predict(input_data, verbose=0)[0][0]
+                # --- SPEED FIX: Call model directly instead of .predict() ---
+                preds = model(input_data, training=False)
+                conf = preds.numpy()[0][0]
+                prediction_history.append(conf)
 
-                if prediction > 0.5:
-                    label = "FATIGUE"
-                    color = (0, 0, 255) # Red
-                    confidence = prediction * 100
+                # --- LOGIC: Average the last 10 frames ---
+                avg_conf = sum(prediction_history) / len(prediction_history)
+
+                if avg_conf > 0.5:
+                    label, color = "FATIGUE", (0, 0, 255)
+                    display_conf = avg_conf * 100
                 else:
-                    label = "ACTIVE"
-                    color = (0, 255, 0) # Green
-                    # If prediction is 0.2 (20% fatigue), it is 80% active
-                    confidence = (1.0 - prediction) * 100 
+                    label, color = "ACTIVE", (0, 255, 0)
+                    display_conf = (1.0 - avg_conf) * 100
 
-                # Combine the label and the percentage (rounded to 1 decimal place)
-                display_text = f"{label}: {confidence:.1f}%"
+                # UI
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, f"{label}: {display_conf:.1f}%", (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-                # Draw the UI
-                cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
-                cv2.putText(frame, display_text, (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-    cv2.imshow('Face-Focused Detection', frame)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    cv2.imshow('Drowsiness Detection', frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
 
 cap.release()
 cv2.destroyAllWindows()
