@@ -32,6 +32,14 @@ model = tf.keras.models.load_model('drowsy_model_v1.keras')
 # --- Smoothing Buffer ---
 prediction_history = deque(maxlen=10) 
 
+# Calibration variables
+IS_CALIBRATING = True
+CALIBRATION_FRAMES = 60  # ~2 seconds of video at 30fps
+baseline_scores = []
+baseline_avg = 0.5 # Stores the moving average
+ALPHA = 0.01 # Controls adaptation speed (0.01 means 1% new data, 99% old)
+personalized_threshold = 0.50 # Default fallback
+
 cap = cv2.VideoCapture(0)
 
 while True:
@@ -72,23 +80,63 @@ while True:
                 conf = preds.numpy()[0][0]
                 prediction_history.append(conf)
 
-                # --- LOGIC: Average the last 10 frames ---
-                avg_conf = sum(prediction_history) / len(prediction_history)
+                # --- 3. THE CALIBRATION MECHANISM ---
+                if IS_CALIBRATING:
+                    baseline_scores.append(conf)
+                    
+                    # Draw Calibration UI
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 165, 0), 2) # Orange
+                    cv2.putText(frame, f"CALIBRATING... {len(baseline_scores)}/{CALIBRATION_FRAMES}", 
+                                (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+                    cv2.putText(frame, "Keep eyes normally open!", 
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-                if avg_conf > 0.5:
-                    label, color = "FATIGUE", (0, 0, 255)
-                    display_conf = avg_conf * 100
+                    # Finish Calibration
+                    if len(baseline_scores) >= CALIBRATION_FRAMES:
+                        # Find their average "Active" score
+                        baseline_avg = np.mean(baseline_scores)
+                        
+                        # Set threshold to 15% higher than their natural resting state
+                        # We cap it at 0.85 so it's not impossible to trigger
+                        personalized_threshold = min(0.85, baseline_avg + 0.15)
+                        
+                        print(f"Calibration Complete. Baseline: {baseline_avg:.2f}, New Threshold: {personalized_threshold:.2f}")
+                        IS_CALIBRATING = False
                 else:
-                    label, color = "ACTIVE", (0, 255, 0)
-                    display_conf = (1.0 - avg_conf) * 100
+                    # --- LOGIC: Average the last 10 frames ---
+                    avg_conf = sum(prediction_history) / len(prediction_history)
 
-                # UI
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, f"{label}: {display_conf:.1f}%", (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    if avg_conf > personalized_threshold:
+                        label, color = "FATIGUE", (0, 0, 255)
+                        display_conf = avg_conf * 100
+                    else:
+                        label, color = "ACTIVE", (0, 255, 0)
+                        # --- ADAPTIVE MOVING AVERAGE ---
+                        # Only update the baseline while the person is ACTIVE
+                        # This allows the model to adjust to new lighting or slight head tilts
+                        baseline_avg = (ALPHA * avg_conf) + (1 - ALPHA) * baseline_avg
+                        personalized_threshold = min(0.85, baseline_avg + 0.15)
+
+                        # Recalculate display percentage relative to their threshold so UI makes sense
+                        display_conf = (1 - avg_conf) * 100 
+                        display_conf = max(0, display_conf) # Prevent negative numbers
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f"{label}: {display_conf:.1f}%", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    
+                    # Debug text to see the active threshold
+                    cv2.putText(frame, f"Threshold: {personalized_threshold:.2f}", (10, h - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     cv2.imshow('Drowsiness Detection', frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'): break
+    # Press 'c' to manually trigger recalibration
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'): 
+        break
+    elif key == ord('c'):
+        IS_CALIBRATING = True
+        baseline_scores = []
 
 cap.release()
 cv2.destroyAllWindows()
